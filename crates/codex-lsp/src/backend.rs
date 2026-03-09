@@ -6,10 +6,12 @@ use crate::protocol::{
     CodexActiveLocks, CodexAgentIntent, CodexEventStream, CodexValidationStatus, EventStreamParams,
     SemanticDiffParams, ValidationIssueAnnotation, ValidationStatusParams,
 };
+use crate::upstream::UpstreamSession;
 use codex_core::{ChangeKind, CodexError, CodexResult, IntentKind, SemanticDiff, SemanticUnit};
 use codex_eventlog::{EventLog, SemanticEvent};
 use codex_graph::CodeGraph;
 use git2::{ObjectType, TreeWalkMode, TreeWalkResult};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,8 +19,8 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::Mutex;
-use tower_lsp::jsonrpc::{Error, Result};
+use tokio::sync::{Mutex, mpsc};
+use tower_lsp::jsonrpc::{Error, ErrorCode, Result};
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, ClientSocket, LanguageServer, LspService};
 
@@ -36,11 +38,13 @@ struct PersistedLockEntry {
     kind: IntentKind,
 }
 
-#[derive(Debug)]
 struct SharedState {
     config: Mutex<CodexLspConfig>,
     open_documents: Mutex<HashMap<Url, OpenDocument>>,
     seen_events: Mutex<HashSet<String>>,
+    local_diagnostics: Mutex<HashMap<Url, Vec<Diagnostic>>>,
+    upstream_diagnostics: Mutex<HashMap<Url, Vec<Diagnostic>>>,
+    upstream: Mutex<Option<Arc<UpstreamSession>>>,
     watcher_started: AtomicBool,
 }
 
@@ -52,7 +56,7 @@ struct ValidationFinding {
 }
 
 /// LSP backend for Codex semantic coordination.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CodexLspBackend {
     client: Client,
     shared: Arc<SharedState>,
@@ -67,6 +71,9 @@ impl CodexLspBackend {
                 config: Mutex::new(config),
                 open_documents: Mutex::new(HashMap::new()),
                 seen_events: Mutex::new(HashSet::new()),
+                local_diagnostics: Mutex::new(HashMap::new()),
+                upstream_diagnostics: Mutex::new(HashMap::new()),
+                upstream: Mutex::new(None),
                 watcher_started: AtomicBool::new(false),
             }),
         }
@@ -194,6 +201,67 @@ impl CodexLspBackend {
         }
     }
 
+    async fn upstream_session(&self) -> Option<Arc<UpstreamSession>> {
+        self.shared.upstream.lock().await.clone()
+    }
+
+    async fn initialize_upstream(&self, params: &InitializeParams) -> Option<InitializeResult> {
+        let config = self.shared.config.lock().await.clone();
+        let command = config.upstream_command.clone()?;
+
+        let repo_path = config.repo_path.clone();
+        let (diagnostics_tx, mut diagnostics_rx) = mpsc::unbounded_channel();
+        let session = match UpstreamSession::spawn(
+            self.client.clone(),
+            repo_path.as_deref(),
+            &command,
+            &config.upstream_args,
+            diagnostics_tx,
+        ) {
+            Ok(session) => session,
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("failed to start upstream language server `{command}`: {err}"),
+                    )
+                    .await;
+                return None;
+            }
+        };
+
+        {
+            let mut upstream = self.shared.upstream.lock().await;
+            *upstream = Some(session.clone());
+        }
+
+        let backend = self.clone();
+        tokio::spawn(async move {
+            while let Some(params) = diagnostics_rx.recv().await {
+                let _ = backend.handle_upstream_diagnostics(params).await;
+            }
+        });
+
+        match session
+            .request("initialize", params)
+            .await
+            .and_then(decode_upstream_response::<InitializeResult>)
+        {
+            Ok(result) => Some(result),
+            Err(err) => {
+                self.client
+                    .log_message(
+                        MessageType::WARNING,
+                        format!("upstream initialize failed; continuing in local-only mode: {err}"),
+                    )
+                    .await;
+                let mut upstream = self.shared.upstream.lock().await;
+                upstream.take();
+                None
+            }
+        }
+    }
+
     async fn maybe_start_event_watcher(&self) {
         if self.shared.watcher_started.swap(true, Ordering::SeqCst) {
             return;
@@ -283,9 +351,8 @@ impl CodexLspBackend {
             })
             .collect();
 
-        self.client
-            .publish_diagnostics(uri.clone(), diagnostics, version)
-            .await;
+        self.store_local_diagnostics(uri.clone(), diagnostics).await;
+        self.publish_merged_diagnostics(uri.clone(), version).await;
         self.client
             .send_notification::<CodexValidationStatus>(ValidationStatusParams {
                 uri: uri.clone(),
@@ -293,6 +360,64 @@ impl CodexLspBackend {
             })
             .await;
         Ok(())
+    }
+
+    async fn handle_upstream_diagnostics(
+        &self,
+        params: PublishDiagnosticsParams,
+    ) -> CodexResult<()> {
+        let version = match params.version {
+            Some(version) => Some(version),
+            None => self
+                .open_document(&params.uri)
+                .await
+                .map(|document| document.version),
+        };
+        self.store_upstream_diagnostics(params.uri.clone(), params.diagnostics)
+            .await;
+        self.publish_merged_diagnostics(params.uri, version).await;
+        Ok(())
+    }
+
+    async fn publish_merged_diagnostics(&self, uri: Url, version: Option<i32>) {
+        let local = self
+            .shared
+            .local_diagnostics
+            .lock()
+            .await
+            .get(&uri)
+            .cloned()
+            .unwrap_or_default();
+        let upstream = self
+            .shared
+            .upstream_diagnostics
+            .lock()
+            .await
+            .get(&uri)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut merged = local;
+        merged.extend(upstream);
+        self.client.publish_diagnostics(uri, merged, version).await;
+    }
+
+    async fn store_local_diagnostics(&self, uri: Url, diagnostics: Vec<Diagnostic>) {
+        let mut all = self.shared.local_diagnostics.lock().await;
+        if diagnostics.is_empty() {
+            all.remove(&uri);
+        } else {
+            all.insert(uri, diagnostics);
+        }
+    }
+
+    async fn store_upstream_diagnostics(&self, uri: Url, diagnostics: Vec<Diagnostic>) {
+        let mut all = self.shared.upstream_diagnostics.lock().await;
+        if diagnostics.is_empty() {
+            all.remove(&uri);
+        } else {
+            all.insert(uri, diagnostics);
+        }
     }
 
     async fn active_lock_annotations(&self, uri: &Url) -> CodexResult<Vec<ActiveLockAnnotation>> {
@@ -344,9 +469,37 @@ impl CodexLspBackend {
     }
 
     async fn clear_diagnostics(&self, uri: &Url) {
+        self.shared.local_diagnostics.lock().await.remove(uri);
+        self.shared.upstream_diagnostics.lock().await.remove(uri);
         self.client
             .publish_diagnostics(uri.clone(), Vec::new(), None)
             .await;
+    }
+
+    async fn forward_notification<P>(&self, method: &str, params: &P)
+    where
+        P: Serialize,
+    {
+        let Some(session) = self.upstream_session().await else {
+            return;
+        };
+        let _ = session.notify(method, params);
+    }
+
+    async fn forward_request<P, R>(&self, method: &str, params: &P) -> Result<Option<R>>
+    where
+        P: Serialize,
+        R: DeserializeOwned,
+    {
+        let Some(session) = self.upstream_session().await else {
+            return Ok(None);
+        };
+
+        let value = session
+            .request(method, params)
+            .await
+            .map_err(upstream_jsonrpc_error)?;
+        decode_upstream_response(value)
     }
 }
 
@@ -354,58 +507,78 @@ impl CodexLspBackend {
 impl LanguageServer for CodexLspBackend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         self.configure_repo_from_initialize(&params).await;
+        let upstream = self.initialize_upstream(&params).await;
+        let capabilities =
+            merged_capabilities(upstream.as_ref().map(|result| &result.capabilities));
+        let upstream_name = upstream
+            .as_ref()
+            .and_then(|result| result.server_info.as_ref())
+            .map(|info| info.name.as_str());
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
-                name: "codex-lsp".to_string(),
+                name: match upstream_name {
+                    Some(name) => format!("codex-lsp + {name}"),
+                    None => "codex-lsp".to_string(),
+                },
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
             }),
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::FULL,
-                )),
-                code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: Some(false),
-                }),
-                execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["codex.nop".to_string()],
-                    work_done_progress_options: WorkDoneProgressOptions {
-                        work_done_progress: None,
-                    },
-                }),
-                ..ServerCapabilities::default()
-            },
+            capabilities,
         })
     }
 
-    async fn initialized(&self, _: InitializedParams) {
+    async fn initialized(&self, params: InitializedParams) {
         self.client
             .log_message(MessageType::INFO, "codex-lsp initialized")
             .await;
         self.maybe_start_event_watcher().await;
         let _ = self.publish_new_events().await;
+        self.forward_notification("initialized", &params).await;
     }
 
     async fn shutdown(&self) -> Result<()> {
+        if let Some(session) = self.upstream_session().await {
+            let _ = session.request("shutdown", &serde_json::Value::Null).await;
+        }
         Ok(())
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let document = params.text_document;
+        let document = params.text_document.clone();
         self.store_open_document(document.uri.clone(), document.version, document.text)
             .await;
         let _ = self.publish_lock_annotations(&document.uri).await;
+        self.forward_notification("textDocument/didOpen", &params)
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        if let Some(change) = params.content_changes.into_iter().last() {
+        if let Some(change) = params.content_changes.last() {
             self.update_open_document(
                 &params.text_document.uri,
                 params.text_document.version,
-                change.text,
+                change.text.clone(),
             )
             .await;
         }
+
+        let text = self
+            .open_document(&params.text_document.uri)
+            .await
+            .map(|document| document.text)
+            .unwrap_or_default();
+        self.forward_notification(
+            "textDocument/didChange",
+            &DidChangeTextDocumentParams {
+                text_document: params.text_document.clone(),
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text,
+                }],
+            },
+        )
+        .await;
     }
 
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
@@ -420,9 +593,19 @@ impl LanguageServer for CodexLspBackend {
         }
 
         let _ = self.refresh_document(&params.text_document.uri).await;
+        self.forward_notification(
+            "textDocument/didSave",
+            &DidSaveTextDocumentParams {
+                text_document: params.text_document,
+                text: None,
+            },
+        )
+        .await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.forward_notification("textDocument/didClose", &params)
+            .await;
         self.remove_open_document(&params.text_document.uri).await;
         self.clear_diagnostics(&params.text_document.uri).await;
     }
@@ -449,6 +632,23 @@ impl LanguageServer for CodexLspBackend {
 
     async fn execute_command(&self, _: ExecuteCommandParams) -> Result<Option<serde_json::Value>> {
         Ok(None)
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        self.forward_request("textDocument/completion", &params)
+            .await
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        self.forward_request("textDocument/hover", &params).await
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.forward_request("textDocument/definition", &params)
+            .await
     }
 }
 
@@ -483,6 +683,55 @@ fn diagnostic_from_finding(finding: &ValidationFinding) -> Diagnostic {
     }
 }
 
+fn merged_capabilities(upstream: Option<&ServerCapabilities>) -> ServerCapabilities {
+    let mut capabilities = upstream.cloned().unwrap_or_default();
+    capabilities.text_document_sync =
+        Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL));
+    capabilities.code_lens_provider = Some(CodeLensOptions {
+        resolve_provider: Some(false),
+    });
+    capabilities.execute_command_provider = Some(merge_execute_command_provider(
+        capabilities.execute_command_provider.take(),
+    ));
+    capabilities
+}
+
+fn merge_execute_command_provider(
+    provider: Option<ExecuteCommandOptions>,
+) -> ExecuteCommandOptions {
+    let mut commands = provider
+        .as_ref()
+        .map(|options| options.commands.clone())
+        .unwrap_or_default();
+    if !commands.iter().any(|command| command == "codex.nop") {
+        commands.push("codex.nop".to_string());
+    }
+
+    ExecuteCommandOptions {
+        commands,
+        work_done_progress_options: provider
+            .map(|options| options.work_done_progress_options)
+            .unwrap_or(WorkDoneProgressOptions {
+                work_done_progress: None,
+            }),
+    }
+}
+
+fn decode_upstream_response<T>(value: serde_json::Value) -> std::result::Result<T, Error>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_value(value).map_err(upstream_jsonrpc_error)
+}
+
+fn upstream_jsonrpc_error(error: impl std::error::Error) -> Error {
+    Error {
+        code: ErrorCode::InternalError,
+        message: error.to_string().into(),
+        data: None,
+    }
+}
+
 async fn read_document_text(backend: &CodexLspBackend, uri: &Url) -> CodexResult<String> {
     if let Some(document) = backend.open_document(uri).await {
         return Ok(document.text);
@@ -498,10 +747,9 @@ fn parse_document_units(uri: &Url, text: &str) -> CodexResult<Vec<SemanticUnit>>
     let path = uri
         .to_file_path()
         .map_err(|_| CodexError::Coordination(format!("unsupported document URI: {uri}")))?;
-    if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
+    let Some(extractor) = codex_parse::extractor_for_path(&path) else {
         return Ok(Vec::new());
-    }
-    let extractor = codex_parse::typescript_extractor();
+    };
     extractor.extract(&path, text.as_bytes())
 }
 
@@ -568,11 +816,11 @@ fn collect_files_at_ref(
             return TreeWalkResult::Ok;
         };
         let full_path = format!("{root}{name}");
-        if Path::new(&full_path)
+        let is_supported = Path::new(&full_path)
             .extension()
             .and_then(|ext| ext.to_str())
-            != Some("ts")
-        {
+            .is_some_and(codex_parse::supports_extension);
+        if !is_supported {
             return TreeWalkResult::Ok;
         }
 
@@ -625,7 +873,11 @@ fn collect_files_recursive(
             continue;
         }
 
-        if path.extension().and_then(|ext| ext.to_str()) != Some("ts") {
+        let is_supported = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(codex_parse::supports_extension);
+        if !is_supported {
             continue;
         }
 
@@ -643,17 +895,30 @@ fn collect_files_recursive(
 }
 
 fn build_graph_from_files(files: &[(String, Vec<u8>)]) -> CodexResult<CodeGraph> {
-    let extractor = codex_parse::typescript_extractor();
+    let extractors: Vec<Box<dyn codex_parse::SemanticExtractor>> =
+        codex_parse::default_extractors();
     let mut all_units = Vec::new();
-    let mut file_contents = Vec::new();
+    let mut file_contexts: Vec<(usize, &[u8])> = Vec::new();
+
     for (path, content) in files {
+        let Some(ext) = Path::new(path).extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        let Some((extractor_index, extractor)) = extractors
+            .iter()
+            .enumerate()
+            .find(|(_, extractor)| extractor.extensions().contains(&ext))
+        else {
+            continue;
+        };
+
         all_units.extend(extractor.extract(Path::new(path), content)?);
-        file_contents.push(content.as_slice());
+        file_contexts.push((extractor_index, content.as_slice()));
     }
 
     let mut deps = Vec::new();
-    for content in file_contents {
-        deps.extend(extractor.dependencies(&all_units, content)?);
+    for (extractor_index, content) in file_contexts {
+        deps.extend(extractors[extractor_index].dependencies(&all_units, content)?);
     }
     let mut graph = CodeGraph::new();
     for unit in all_units {

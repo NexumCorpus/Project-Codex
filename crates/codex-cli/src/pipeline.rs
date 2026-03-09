@@ -133,7 +133,7 @@ pub fn build_graph(
 /// Run the full semantic diff pipeline between two git refs.
 pub fn run_diff(repo_path: &Path, ref_a: &str, ref_b: &str) -> CodexResult<SemanticDiff> {
     let repo = git2::Repository::open(repo_path).map_err(|err| CodexError::Git(err.to_string()))?;
-    let extractors: Vec<Box<dyn SemanticExtractor>> = vec![codex_parse::typescript_extractor()];
+    let extractors: Vec<Box<dyn SemanticExtractor>> = codex_parse::default_extractors();
 
     let files_a = collect_files_at_ref(&repo, ref_a, &extractors)?;
     let files_b = collect_files_at_ref(&repo, ref_b, &extractors)?;

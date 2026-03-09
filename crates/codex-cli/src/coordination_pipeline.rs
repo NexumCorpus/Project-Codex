@@ -101,7 +101,7 @@ pub fn save_locks(repo_path: &Path, entries: &[LockEntry]) -> CodexResult<()> {
 ///
 /// Algorithm:
 /// 1. Open the repository at `repo_path` via `git2::Repository::open`
-/// 2. Create the TypeScript extractor: `vec![codex_parse::typescript_extractor()]`
+/// 2. Create the built-in extractor set: `codex_parse::default_extractors()`
 /// 3. Collect source files from HEAD using `crate::pipeline::collect_files_at_ref(&repo, "HEAD", &extractors)`
 /// 4. Build the graph using `crate::pipeline::build_graph(&files, &extractors)`
 /// 5. Return the graph
@@ -110,7 +110,7 @@ pub fn save_locks(repo_path: &Path, entries: &[LockEntry]) -> CodexResult<()> {
 pub fn build_graph_from_head(repo_path: &Path) -> CodexResult<CodeGraph> {
     let repo = git2::Repository::open(repo_path).map_err(|err| CodexError::Git(err.to_string()))?;
     let extractors: Vec<Box<dyn codex_parse::SemanticExtractor>> =
-        vec![codex_parse::typescript_extractor()];
+        codex_parse::default_extractors();
     let files = crate::pipeline::collect_files_at_ref(&repo, "HEAD", &extractors)?;
     crate::pipeline::build_graph(&files, &extractors)
 }
@@ -240,7 +240,7 @@ pub fn run_locks(repo_path: &Path) -> CodexResult<Vec<LockEntry>> {
 ///
 /// Full flow:
 /// 1. Open the git repository at `repo_path`
-/// 2. Create the TypeScript extractor
+/// 2. Create the built-in extractor set
 /// 3. Build CodeGraph at `base_ref` via `collect_files_at_ref` + `build_graph`
 /// 4. Build CodeGraph at HEAD via `collect_files_at_ref` + `build_graph`
 /// 5. Convert `agent_name` to `AgentId` via `agent_name_to_id`
@@ -260,7 +260,7 @@ pub fn run_validate(
 ) -> CodexResult<codex_core::ValidationReport> {
     let repo = git2::Repository::open(repo_path).map_err(|err| CodexError::Git(err.to_string()))?;
     let extractors: Vec<Box<dyn codex_parse::SemanticExtractor>> =
-        vec![codex_parse::typescript_extractor()];
+        codex_parse::default_extractors();
 
     let files_before = crate::pipeline::collect_files_at_ref(&repo, base_ref, &extractors)?;
     let files_after = crate::pipeline::collect_files_at_ref(&repo, "HEAD", &extractors)?;

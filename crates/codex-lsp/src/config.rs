@@ -12,6 +12,10 @@ pub struct CodexLspConfig {
     pub base_ref: String,
     /// Poll interval for semantic event notifications.
     pub event_poll_ms: u64,
+    /// Optional upstream stdio language server command.
+    pub upstream_command: Option<String>,
+    /// Arguments passed to the upstream stdio language server command.
+    pub upstream_args: Vec<String>,
 }
 
 impl Default for CodexLspConfig {
@@ -20,6 +24,8 @@ impl Default for CodexLspConfig {
             repo_path: None,
             base_ref: "HEAD~1".to_string(),
             event_poll_ms: 500,
+            upstream_command: None,
+            upstream_args: Vec::new(),
         }
     }
 }

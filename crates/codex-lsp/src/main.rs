@@ -15,6 +15,12 @@ struct Args {
     /// Poll interval in milliseconds for semantic event notifications.
     #[arg(long, default_value_t = 500)]
     event_poll_ms: u64,
+    /// Optional upstream stdio language server command.
+    #[arg(long)]
+    upstream_command: Option<String>,
+    /// Repeated upstream stdio language server arguments.
+    #[arg(long)]
+    upstream_arg: Vec<String>,
 }
 
 #[tokio::main]
@@ -24,6 +30,8 @@ async fn main() {
         repo_path: args.repo_path,
         base_ref: args.base_ref,
         event_poll_ms: args.event_poll_ms,
+        upstream_command: args.upstream_command,
+        upstream_args: args.upstream_arg,
     };
 
     let stdin = tokio::io::stdin();

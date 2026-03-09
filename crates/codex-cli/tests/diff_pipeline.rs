@@ -14,7 +14,7 @@
 use codex_cli::output::format_diff;
 use codex_cli::pipeline::{build_graph, collect_files_at_ref, run_diff};
 use codex_core::ChangeKind;
-use codex_parse::typescript_extractor;
+use codex_parse::{default_extractors, typescript_extractor};
 use std::path::Path;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +135,20 @@ fn build_graph_skips_non_ts_files() {
     let graph = build_graph(&files, &extractors).expect("build graph");
     // Only the .ts file should be parsed
     assert_eq!(graph.unit_count(), 1);
+}
+
+#[test]
+fn build_graph_supports_python_files_in_default_set() {
+    let py_file = (
+        "src/main.py".to_string(),
+        b"def main() -> None:\n    return None\n".to_vec(),
+    );
+    let files = vec![py_file];
+    let extractors = default_extractors();
+
+    let graph = build_graph(&files, &extractors).expect("build graph");
+    assert_eq!(graph.unit_count(), 1);
+    assert_eq!(graph.units()[0].name, "main");
 }
 
 #[test]
@@ -364,6 +378,32 @@ fn diff_multiple_files_mixed_changes() {
     assert_eq!(diff.modified[0].after.name, "toModify");
 }
 
+#[test]
+fn diff_detects_python_body_change() {
+    let (_dir, repo) = init_temp_repo();
+
+    write_and_stage(
+        &repo,
+        "src/app.py",
+        "def greet(name: str) -> str:\n    return 'hello ' + name\n",
+    );
+    let c1 = commit(&repo, "v1");
+    tag(&repo, c1, "v1");
+
+    write_and_stage(
+        &repo,
+        "src/app.py",
+        "def greet(name: str) -> str:\n    return 'hi ' + name\n",
+    );
+    let c2 = commit(&repo, "v2");
+    tag(&repo, c2, "v2");
+
+    let diff = run_diff(repo.workdir().unwrap(), "v1", "v2").expect("run diff");
+    assert_eq!(diff.modified.len(), 1);
+    assert_eq!(diff.modified[0].after.name, "greet");
+    assert!(diff.modified[0].changes.contains(&ChangeKind::BodyChanged));
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 3. Git file collection tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -384,6 +424,27 @@ fn collect_files_returns_only_supported_extensions() {
     // Only main.ts should be collected
     assert_eq!(files.len(), 1);
     assert!(files[0].0.contains("main.ts"));
+}
+
+#[test]
+fn collect_files_includes_python_when_extractor_available() {
+    let (_dir, repo) = init_temp_repo();
+
+    write_and_stage(&repo, "src/main.ts", "function main() {}");
+    write_and_stage(
+        &repo,
+        "src/helper.py",
+        "def helper() -> None:\n    return None\n",
+    );
+    let c1 = commit(&repo, "initial");
+    tag(&repo, c1, "v1");
+
+    let extractors = default_extractors();
+    let files = collect_files_at_ref(&repo, "v1", &extractors).expect("collect files");
+
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().any(|(path, _)| path.contains("main.ts")));
+    assert!(files.iter().any(|(path, _)| path.contains("helper.py")));
 }
 
 #[test]

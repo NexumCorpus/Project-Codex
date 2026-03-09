@@ -34,7 +34,7 @@ impl ConflictDetector {
         let repo =
             git2::Repository::open(repo_path).map_err(|err| CodexError::Git(err.to_string()))?;
         let merge_base = find_merge_base(&repo, branch_a, branch_b)?;
-        let extractors: Vec<Box<dyn SemanticExtractor>> = vec![codex_parse::typescript_extractor()];
+        let extractors: Vec<Box<dyn SemanticExtractor>> = codex_parse::default_extractors();
 
         let graph_base = build_graph_at_ref(&repo, &merge_base.to_string(), &extractors)?;
         let graph_a = build_graph_at_ref(&repo, branch_a, &extractors)?;

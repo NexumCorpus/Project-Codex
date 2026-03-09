@@ -11,6 +11,7 @@
 pub mod backend;
 pub mod config;
 pub mod protocol;
+mod upstream;
 
 pub use backend::{CodexLspBackend, build_service};
 pub use config::CodexLspConfig;

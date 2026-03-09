@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "codex-lsp"
 path = "src/main.rs"
 
+[[bin]]
+name = "codex-lsp-fake-upstream"
+path = "src/bin/codex-lsp-fake-upstream.rs"
+
 [dependencies]
 clap = { workspace = true }
 codex-core = { workspace = true }
@@ -26,9 +30,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tower = { version = "0.4", features = ["util"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
 futures-util = "0.3"
 tempfile = "3"
-tower = { version = "0.4", features = ["util"] }

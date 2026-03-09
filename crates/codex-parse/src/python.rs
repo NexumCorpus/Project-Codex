@@ -1,8 +1,8 @@
-//! TypeScript semantic extractor.
+//! Python semantic extractor.
 //!
-//! Implements SemanticExtractor using tree-sitter-typescript.
-//! Extracts: function_declaration, class_declaration, method_definition,
-//! interface_declaration, named arrow_function.
+//! Implements SemanticExtractor using tree-sitter-python.
+//! Extracts: function_definition, class_definition, decorated methods/functions,
+//! and named lambda assignments.
 
 use crate::SemanticExtractor;
 use codex_core::{CodexError, CodexResult, DepKind, SemanticId, SemanticUnit, UnitKind};
@@ -11,11 +11,11 @@ use std::ops::Range;
 use std::path::Path;
 use tree_sitter::{Node, Parser, Tree};
 
-const EXTENSIONS: &[&str] = &["ts", "tsx"];
+const EXTENSIONS: &[&str] = &["py"];
 
-/// TypeScript/TSX semantic extractor backed by tree-sitter.
+/// Python semantic extractor backed by tree-sitter.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct TypeScriptExtractor;
+pub struct PythonExtractor;
 
 #[derive(Debug, Clone)]
 struct UnitInfo {
@@ -30,23 +30,23 @@ struct ImportSymbol {
     module_name: String,
 }
 
-impl TypeScriptExtractor {
-    /// Create a new TypeScript extractor.
+impl PythonExtractor {
+    /// Create a new Python extractor.
     pub fn new() -> Self {
         let mut parser = Parser::new();
-        let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
+        let language = tree_sitter_python::LANGUAGE.into();
         parser
             .set_language(&language)
-            .expect("tree-sitter TypeScript grammar must load");
+            .expect("tree-sitter Python grammar must load");
         Self
     }
 
     fn parse(&self, path: &Path, source: &[u8]) -> CodexResult<Tree> {
         let mut parser = Parser::new();
-        let language = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-        parser.set_language(&language).map_err(|err| {
-            parse_error(path, format!("failed to load TypeScript grammar: {err}"))
-        })?;
+        let language = tree_sitter_python::LANGUAGE.into();
+        parser
+            .set_language(&language)
+            .map_err(|err| parse_error(path, format!("failed to load Python grammar: {err}")))?;
 
         parser
             .parse(source, None)
@@ -71,24 +71,72 @@ impl TypeScriptExtractor {
         let mut cursor = node.walk();
         for child in node.named_children(&mut cursor) {
             match child.kind() {
-                "function_declaration" => {
-                    if let Some(unit) = self.function_unit(child, path, source) {
+                "function_definition" => {
+                    if let Some(unit) = self.function_unit(child, path, source, None) {
                         units.push(unit);
                     }
                 }
-                "class_declaration" => self.collect_class_units(child, path, source, units)?,
-                "interface_declaration" => {
-                    if let Some(unit) = self.interface_unit(child, path, source) {
+                "class_definition" => self.collect_class_units(child, path, source, units, None)?,
+                "decorated_definition" => {
+                    self.collect_decorated_definition(child, path, source, units)?
+                }
+                "assignment" => {
+                    if let Some(unit) = self.lambda_assignment_unit(child, path, source) {
                         units.push(unit);
                     }
                 }
-                "lexical_declaration" => self.collect_arrow_units(child, path, source, units),
-                "export_statement" | "export_default_declaration" => {
-                    self.collect_program_units(child, path, source, units)?;
+                "expression_statement" => {
+                    self.collect_expression_statement(child, path, source, units)
                 }
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn collect_expression_statement(
+        &self,
+        node: Node<'_>,
+        path: &Path,
+        source: &[u8],
+        units: &mut Vec<UnitInfo>,
+    ) {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            if child.kind() != "assignment" {
+                continue;
+            }
+            if let Some(unit) = self.lambda_assignment_unit(child, path, source) {
+                units.push(unit);
+            }
+        }
+    }
+
+    fn collect_decorated_definition(
+        &self,
+        node: Node<'_>,
+        path: &Path,
+        source: &[u8],
+        units: &mut Vec<UnitInfo>,
+    ) -> CodexResult<()> {
+        let Some(definition) = node.child_by_field_name("definition") else {
+            return Ok(());
+        };
+
+        match definition.kind() {
+            "function_definition" => {
+                if let Some(unit) =
+                    self.function_unit(definition, path, source, Some(node.byte_range()))
+                {
+                    units.push(unit);
+                }
+            }
+            "class_definition" => {
+                self.collect_class_units(definition, path, source, units, Some(node.byte_range()))?
+            }
+            _ => {}
+        }
+
         Ok(())
     }
 
@@ -98,28 +146,28 @@ impl TypeScriptExtractor {
         path: &Path,
         source: &[u8],
         units: &mut Vec<UnitInfo>,
+        range_override: Option<Range<usize>>,
     ) -> CodexResult<()> {
-        let Some(class_name_node) = node.child_by_field_name("name") else {
+        let Some(name_node) = node.child_by_field_name("name") else {
             return Ok(());
         };
-        let Some(class_name) = node_text(class_name_node, source) else {
+        let Some(class_name) = node_text(name_node, source) else {
             return Ok(());
         };
 
         let body = node.child_by_field_name("body");
-        let heritage = collect_class_heritage(node, source);
         units.push(UnitInfo {
             unit: build_unit(
                 UnitKind::Class,
                 class_name.clone(),
                 class_name.clone(),
                 path,
-                node.byte_range(),
+                range_override.unwrap_or_else(|| node.byte_range()),
                 hash_u64(b""),
                 body.map_or_else(|| hash_u64(b""), |body| normalized_body_hash(body, source)),
             ),
             body_range: None,
-            heritage,
+            heritage: collect_class_heritage(node, source),
         });
 
         let Some(body) = body else {
@@ -128,46 +176,43 @@ impl TypeScriptExtractor {
 
         let mut cursor = body.walk();
         for child in body.named_children(&mut cursor) {
-            if child.kind() != "method_definition" {
-                continue;
-            }
-            if let Some(method_unit) = self.method_unit(child, &class_name, path, source) {
-                units.push(method_unit);
+            match child.kind() {
+                "function_definition" => {
+                    if let Some(unit) = self.method_unit(child, &class_name, path, source, None) {
+                        units.push(unit);
+                    }
+                }
+                "decorated_definition" => {
+                    let Some(definition) = child.child_by_field_name("definition") else {
+                        continue;
+                    };
+                    if definition.kind() != "function_definition" {
+                        continue;
+                    }
+                    if let Some(unit) = self.method_unit(
+                        definition,
+                        &class_name,
+                        path,
+                        source,
+                        Some(child.byte_range()),
+                    ) {
+                        units.push(unit);
+                    }
+                }
+                _ => {}
             }
         }
 
         Ok(())
     }
 
-    fn collect_arrow_units(
+    fn function_unit(
         &self,
         node: Node<'_>,
         path: &Path,
         source: &[u8],
-        units: &mut Vec<UnitInfo>,
-    ) {
-        let Some(kind_node) = node.child_by_field_name("kind") else {
-            return;
-        };
-        let Some(kind_text) = node_text(kind_node, source) else {
-            return;
-        };
-        if kind_text != "const" {
-            return;
-        }
-
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() != "variable_declarator" {
-                continue;
-            }
-            if let Some(unit) = self.arrow_function_unit(child, path, source) {
-                units.push(unit);
-            }
-        }
-    }
-
-    fn function_unit(&self, node: Node<'_>, path: &Path, source: &[u8]) -> Option<UnitInfo> {
+        range_override: Option<Range<usize>>,
+    ) -> Option<UnitInfo> {
         let name_node = node.child_by_field_name("name")?;
         let name = node_text(name_node, source)?;
         let body = node.child_by_field_name("body");
@@ -178,7 +223,7 @@ impl TypeScriptExtractor {
                 name.clone(),
                 name,
                 path,
-                node.byte_range(),
+                range_override.unwrap_or_else(|| node.byte_range()),
                 signature_hash(node, source),
                 body.map_or_else(|| hash_u64(b""), |body| normalized_body_hash(body, source)),
             ),
@@ -193,19 +238,19 @@ impl TypeScriptExtractor {
         class_name: &str,
         path: &Path,
         source: &[u8],
+        range_override: Option<Range<usize>>,
     ) -> Option<UnitInfo> {
         let name_node = node.child_by_field_name("name")?;
-        let name = property_name(name_node, source)?;
-        let qualified_name = format!("{class_name}::{name}");
+        let name = node_text(name_node, source)?;
         let body = node.child_by_field_name("body");
 
         Some(UnitInfo {
             unit: build_unit(
                 UnitKind::Method,
-                name,
-                qualified_name,
+                name.clone(),
+                format!("{class_name}::{name}"),
                 path,
-                node.byte_range(),
+                range_override.unwrap_or_else(|| node.byte_range()),
                 signature_hash(node, source),
                 body.map_or_else(|| hash_u64(b""), |body| normalized_body_hash(body, source)),
             ),
@@ -214,38 +259,20 @@ impl TypeScriptExtractor {
         })
     }
 
-    fn interface_unit(&self, node: Node<'_>, path: &Path, source: &[u8]) -> Option<UnitInfo> {
-        let name_node = node.child_by_field_name("name")?;
-        let name = node_text(name_node, source)?;
-        let body = node.child_by_field_name("body");
-
-        Some(UnitInfo {
-            unit: build_unit(
-                UnitKind::Interface,
-                name.clone(),
-                name,
-                path,
-                node.byte_range(),
-                hash_u64(b""),
-                body.map_or_else(|| hash_u64(b""), |body| normalized_body_hash(body, source)),
-            ),
-            body_range: None,
-            heritage: Vec::new(),
-        })
-    }
-
-    fn arrow_function_unit(&self, node: Node<'_>, path: &Path, source: &[u8]) -> Option<UnitInfo> {
-        let name_node = node.child_by_field_name("name")?;
-        if name_node.kind() != "identifier" {
-            return None;
-        }
-        let name = node_text(name_node, source)?;
-        let value = node.child_by_field_name("value")?;
-        if value.kind() != "arrow_function" {
+    fn lambda_assignment_unit(
+        &self,
+        node: Node<'_>,
+        path: &Path,
+        source: &[u8],
+    ) -> Option<UnitInfo> {
+        let left = node.child_by_field_name("left")?;
+        let right = node.child_by_field_name("right")?;
+        if right.kind() != "lambda" {
             return None;
         }
 
-        let body = value.child_by_field_name("body");
+        let name = assignment_name(left, source)?;
+        let body = right.child_by_field_name("body");
 
         Some(UnitInfo {
             unit: build_unit(
@@ -254,7 +281,7 @@ impl TypeScriptExtractor {
                 name,
                 path,
                 node.byte_range(),
-                signature_hash(value, source),
+                signature_hash(right, source),
                 body.map_or_else(|| hash_u64(b""), |body| normalized_body_hash(body, source)),
             ),
             body_range: body.map(|body| body.byte_range()),
@@ -263,7 +290,7 @@ impl TypeScriptExtractor {
     }
 }
 
-impl SemanticExtractor for TypeScriptExtractor {
+impl SemanticExtractor for PythonExtractor {
     fn extensions(&self) -> &[&str] {
         EXTENSIONS
     }
@@ -285,7 +312,7 @@ impl SemanticExtractor for TypeScriptExtractor {
         let path = units
             .first()
             .map(|unit| unit.file_path.as_path())
-            .unwrap_or_else(|| Path::new("<memory.ts>"));
+            .unwrap_or_else(|| Path::new("<memory.py>"));
         let (tree, analyzed_units) = self.analyze(path, source)?;
         let root = tree.root_node();
 
@@ -295,7 +322,7 @@ impl SemanticExtractor for TypeScriptExtractor {
             .collect();
 
         let mut ids_by_name: HashMap<&str, Vec<SemanticId>> = HashMap::new();
-        for unit in units.iter().filter(|unit| is_typescript_unit(unit)) {
+        for unit in units.iter().filter(|unit| is_python_unit(unit)) {
             ids_by_name
                 .entry(unit.name.as_str())
                 .or_default()
@@ -305,7 +332,7 @@ impl SemanticExtractor for TypeScriptExtractor {
         let imports = collect_imports(root, source);
         let mut edges: HashSet<(SemanticId, SemanticId, DepKind)> = HashSet::new();
 
-        for unit in units.iter().filter(|unit| is_typescript_unit(unit)) {
+        for unit in units.iter().filter(|unit| is_python_unit(unit)) {
             let Some(info) = unit_by_id.get(&unit.id).copied() else {
                 continue;
             };
@@ -403,7 +430,6 @@ fn hash_u64(bytes: &[u8]) -> u64 {
 fn signature_hash(node: Node<'_>, source: &[u8]) -> u64 {
     let params = node
         .child_by_field_name("parameters")
-        .or_else(|| node.child_by_field_name("parameter"))
         .and_then(|params| node_text(params, source))
         .unwrap_or_default();
     let return_type = node
@@ -443,33 +469,15 @@ fn collect_leaf_tokens(node: Node<'_>, source: &[u8], tokens: &mut Vec<String>) 
 }
 
 fn collect_class_heritage(node: Node<'_>, source: &[u8]) -> Vec<(String, DepKind)> {
-    let mut heritage = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "class_heritage" {
-            continue;
-        }
+    let Some(superclasses) = node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
 
-        let mut heritage_cursor = child.walk();
-        for clause in child.named_children(&mut heritage_cursor) {
-            match clause.kind() {
-                "extends_clause" => {
-                    if let Some(value) = clause.child_by_field_name("value")
-                        && let Some(name) = reference_name(value, source)
-                    {
-                        heritage.push((name, DepKind::Inherits));
-                    }
-                }
-                "implements_clause" => {
-                    let mut clause_cursor = clause.walk();
-                    for implemented in clause.named_children(&mut clause_cursor) {
-                        if let Some(name) = reference_name(implemented, source) {
-                            heritage.push((name, DepKind::Implements));
-                        }
-                    }
-                }
-                _ => {}
-            }
+    let mut heritage = Vec::new();
+    let mut cursor = superclasses.walk();
+    for child in superclasses.named_children(&mut cursor) {
+        if let Some(name) = reference_name(child, source) {
+            heritage.push((name, DepKind::Inherits));
         }
     }
     heritage
@@ -482,7 +490,10 @@ fn collect_imports(root: Node<'_>, source: &[u8]) -> Vec<ImportSymbol> {
 }
 
 fn collect_imports_recursive(node: Node<'_>, source: &[u8], imports: &mut Vec<ImportSymbol>) {
-    if node.kind() == "import_statement" {
+    if matches!(
+        node.kind(),
+        "import_statement" | "import_from_statement" | "future_import_statement"
+    ) {
         imports.extend(import_symbols_from_statement(node, source));
     }
 
@@ -493,69 +504,81 @@ fn collect_imports_recursive(node: Node<'_>, source: &[u8], imports: &mut Vec<Im
 }
 
 fn import_symbols_from_statement(node: Node<'_>, source: &[u8]) -> Vec<ImportSymbol> {
-    let module_name = node
-        .child_by_field_name("source")
-        .and_then(|source_node| node_text(source_node, source))
-        .unwrap_or_default();
-    if module_name.is_empty() {
-        return Vec::new();
-    }
-
-    let mut symbols = Vec::new();
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() != "import_clause" {
-            continue;
-        }
-
-        let mut clause_cursor = child.walk();
-        for clause_child in child.named_children(&mut clause_cursor) {
-            match clause_child.kind() {
-                "identifier" => {
-                    if let Some(name) = node_text(clause_child, source) {
-                        symbols.push(ImportSymbol {
-                            local_name: name,
-                            module_name: module_name.clone(),
-                        });
-                    }
-                }
-                "namespace_import" => {
-                    let mut namespace_cursor = clause_child.walk();
-                    for namespace_child in clause_child.named_children(&mut namespace_cursor) {
-                        if namespace_child.kind() == "identifier"
-                            && let Some(name) = node_text(namespace_child, source)
-                        {
-                            symbols.push(ImportSymbol {
-                                local_name: name,
-                                module_name: module_name.clone(),
-                            });
-                        }
-                    }
-                }
-                "named_imports" => {
-                    let mut import_cursor = clause_child.walk();
-                    for specifier in clause_child.named_children(&mut import_cursor) {
-                        if specifier.kind() != "import_specifier" {
-                            continue;
-                        }
-                        let local_name = specifier
+    match node.kind() {
+        "import_statement" | "future_import_statement" => {
+            let mut imports = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children_by_field_name("name", &mut cursor) {
+                match child.kind() {
+                    "aliased_import" => {
+                        let alias = child
                             .child_by_field_name("alias")
-                            .or_else(|| specifier.child_by_field_name("name"))
-                            .and_then(|name_node| node_text(name_node, source));
-                        if let Some(local_name) = local_name {
-                            symbols.push(ImportSymbol {
+                            .and_then(|alias| node_text(alias, source));
+                        let module_name = child
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(name, source));
+                        if let (Some(local_name), Some(module_name)) = (alias, module_name) {
+                            imports.push(ImportSymbol {
                                 local_name,
-                                module_name: module_name.clone(),
+                                module_name,
                             });
                         }
                     }
+                    "dotted_name" => {
+                        if let Some(module_name) = node_text(child, source) {
+                            imports.push(ImportSymbol {
+                                local_name: root_name(&module_name).to_string(),
+                                module_name,
+                            });
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            imports
         }
-    }
+        "import_from_statement" => {
+            let module_name = node
+                .child_by_field_name("module_name")
+                .and_then(|module_name| node_text(module_name, source))
+                .unwrap_or_default();
+            if module_name.is_empty() {
+                return Vec::new();
+            }
 
-    symbols
+            let mut imports = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children_by_field_name("name", &mut cursor) {
+                match child.kind() {
+                    "aliased_import" => {
+                        let alias = child
+                            .child_by_field_name("alias")
+                            .and_then(|alias| node_text(alias, source));
+                        let imported_name = child
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(name, source));
+                        if let (Some(local_name), Some(imported_name)) = (alias, imported_name) {
+                            imports.push(ImportSymbol {
+                                local_name,
+                                module_name: format!("{module_name}.{imported_name}"),
+                            });
+                        }
+                    }
+                    "dotted_name" => {
+                        if let Some(imported_name) = node_text(child, source) {
+                            imports.push(ImportSymbol {
+                                local_name: tail_name(&imported_name).to_string(),
+                                module_name: format!("{module_name}.{imported_name}"),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            imports
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn collect_called_names(node: Node<'_>, source: &[u8]) -> HashSet<String> {
@@ -565,7 +588,7 @@ fn collect_called_names(node: Node<'_>, source: &[u8]) -> HashSet<String> {
 }
 
 fn collect_called_names_recursive(node: Node<'_>, source: &[u8], names: &mut HashSet<String>) {
-    if node.kind() == "call_expression"
+    if node.kind() == "call"
         && let Some(function_node) = node.child_by_field_name("function")
         && let Some(name) = callee_name(function_node, source)
     {
@@ -580,23 +603,17 @@ fn collect_called_names_recursive(node: Node<'_>, source: &[u8], names: &mut Has
 
 fn callee_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "identifier" | "property_identifier" | "private_property_identifier" => {
-            node_text(node, source)
-        }
-        "member_expression" => node
-            .child_by_field_name("property")
-            .and_then(|property| callee_name(property, source)),
-        "instantiation_expression"
-        | "parenthesized_expression"
-        | "non_null_expression"
-        | "as_expression"
-        | "satisfies_expression"
-        | "type_assertion" => {
+        "identifier" => node_text(node, source),
+        "attribute" => node
+            .child_by_field_name("attribute")
+            .and_then(|attribute| node_text(attribute, source))
+            .or_else(|| {
+                node.child_by_field_name("object")
+                    .and_then(|object| callee_name(object, source))
+            }),
+        "call" | "parenthesized_expression" | "type" | "subscript" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if child.kind() == "type_arguments" {
-                    continue;
-                }
                 if let Some(name) = callee_name(child, source) {
                     return Some(name);
                 }
@@ -614,7 +631,7 @@ fn collect_identifier_names(node: Node<'_>, source: &[u8]) -> HashSet<String> {
 }
 
 fn collect_identifier_names_recursive(node: Node<'_>, source: &[u8], names: &mut HashSet<String>) {
-    if matches!(node.kind(), "identifier" | "type_identifier")
+    if node.kind() == "identifier"
         && let Some(name) = node_text(node, source)
     {
         names.insert(name);
@@ -628,19 +645,17 @@ fn collect_identifier_names_recursive(node: Node<'_>, source: &[u8], names: &mut
 
 fn reference_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "identifier" | "type_identifier" | "property_identifier" => node_text(node, source),
-        "member_expression" => node
-            .child_by_field_name("property")
-            .and_then(|property| reference_name(property, source))
+        "identifier" | "dotted_name" => {
+            node_text(node, source).map(|name| tail_name(&name).to_string())
+        }
+        "attribute" => node
+            .child_by_field_name("attribute")
+            .and_then(|attribute| node_text(attribute, source))
             .or_else(|| {
                 node.child_by_field_name("object")
                     .and_then(|object| reference_name(object, source))
             }),
-        "generic_type"
-        | "type_annotation"
-        | "nested_type_identifier"
-        | "predefined_type"
-        | "lookup_type" => {
+        "type" | "subscript" | "generic_type" | "type_parameter" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
                 if let Some(name) = reference_name(child, source) {
@@ -661,13 +676,19 @@ fn reference_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     }
 }
 
-fn property_name(node: Node<'_>, source: &[u8]) -> Option<String> {
+fn assignment_name(node: Node<'_>, source: &[u8]) -> Option<String> {
     match node.kind() {
-        "property_identifier" | "private_property_identifier" | "identifier" => {
-            node_text(node, source)
+        "identifier" => node_text(node, source),
+        "pattern_list" | "tuple_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(name) = assignment_name(child, source) {
+                    return Some(name);
+                }
+            }
+            None
         }
-        "computed_property_name" => None,
-        _ => node_text(node, source),
+        _ => None,
     }
 }
 
@@ -689,6 +710,7 @@ fn find_node_by_range<'tree>(node: Node<'tree>, range: &Range<usize>) -> Option<
             return Some(found);
         }
     }
+
     None
 }
 
@@ -702,11 +724,19 @@ fn dep_kind_rank(kind: DepKind) -> u8 {
     }
 }
 
-fn is_typescript_unit(unit: &SemanticUnit) -> bool {
+fn is_python_unit(unit: &SemanticUnit) -> bool {
     unit.file_path
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| EXTENSIONS.contains(&ext))
+}
+
+fn root_name(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
+}
+
+fn tail_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
 }
 
 fn parse_error(path: &Path, message: impl Into<String>) -> CodexError {

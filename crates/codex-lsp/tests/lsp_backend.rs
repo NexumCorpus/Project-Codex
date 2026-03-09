@@ -2,13 +2,19 @@ use codex_core::SemanticDiff;
 use codex_eventlog::SemanticEvent;
 use codex_lsp::protocol::EventStreamParams;
 use codex_lsp::{CodexLspConfig, build_service};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use std::path::Path;
 use tower::Service;
 use tower::util::ServiceExt;
 use tower_lsp::LanguageServer;
-use tower_lsp::jsonrpc::Request;
-use tower_lsp::lsp_types::{CodeLensParams, TextDocumentIdentifier, Url, WorkDoneProgressParams};
+use tower_lsp::jsonrpc::{Request, Response};
+use tower_lsp::lsp_types::{
+    CodeLensParams, CompletionContext, CompletionParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, GotoDefinitionParams, HoverContents, HoverParams,
+    PartialResultParams, Position, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, WorkDoneProgressParams,
+};
 
 fn init_temp_repo() -> (tempfile::TempDir, git2::Repository) {
     let dir = tempfile::tempdir().expect("create tempdir");
@@ -81,6 +87,94 @@ async fn initialize_service(
         .unwrap();
 }
 
+fn test_config(repo: &git2::Repository) -> CodexLspConfig {
+    CodexLspConfig {
+        repo_path: Some(repo.workdir().unwrap().to_path_buf()),
+        base_ref: "HEAD".to_string(),
+        event_poll_ms: 20,
+        upstream_command: None,
+        upstream_args: Vec::new(),
+    }
+}
+
+fn upstream_test_config(repo: &git2::Repository) -> CodexLspConfig {
+    CodexLspConfig {
+        upstream_command: Some(env!("CARGO_BIN_EXE_codex-lsp-fake-upstream").to_string()),
+        ..test_config(repo)
+    }
+}
+
+fn position_params(uri: &Url) -> TextDocumentPositionParams {
+    TextDocumentPositionParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        position: Position {
+            line: 0,
+            character: 0,
+        },
+    }
+}
+
+fn spawn_client_socket_task(
+    socket: tower_lsp::ClientSocket,
+) -> tokio::sync::mpsc::UnboundedReceiver<Request> {
+    let (mut stream, mut sink) = socket.split();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(request) = stream.next().await {
+            let forwarded = request.clone();
+            let _ = tx.send(forwarded);
+            if let Some(id) = request.id().cloned() {
+                sink.send(Response::from_ok(id, json!(null)))
+                    .await
+                    .expect("respond to client request");
+            }
+        }
+    });
+    rx
+}
+
+async fn wait_for_notification(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
+    method: &str,
+) -> Request {
+    let deadline = std::time::Duration::from_secs(3);
+    tokio::time::timeout(deadline, async {
+        loop {
+            let request = rx.recv().await.expect("server notification");
+            if request.method() == method {
+                return request;
+            }
+        }
+    })
+    .await
+    .expect("notification before timeout")
+}
+
+async fn wait_for_publish_diagnostics(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Request>,
+    expected_count: usize,
+) -> serde_json::Value {
+    let deadline = std::time::Duration::from_secs(3);
+    tokio::time::timeout(deadline, async {
+        loop {
+            let request = rx.recv().await.expect("server notification");
+            if request.method() != "textDocument/publishDiagnostics" {
+                continue;
+            }
+            let params = request.params().cloned().expect("diagnostics params");
+            let count = params["diagnostics"]
+                .as_array()
+                .map(|diagnostics| diagnostics.len())
+                .unwrap_or_default();
+            if count >= expected_count {
+                return params;
+            }
+        }
+    })
+    .await
+    .expect("diagnostics before timeout")
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn semantic_diff_custom_method_returns_file_scoped_changes() {
     let (_dir, repo) = init_temp_repo();
@@ -111,11 +205,7 @@ async fn semantic_diff_custom_method_returns_file_scoped_changes() {
     .unwrap();
 
     let app_uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.ts")).unwrap();
-    let config = CodexLspConfig {
-        repo_path: Some(repo.workdir().unwrap().to_path_buf()),
-        base_ref: "HEAD".to_string(),
-        event_poll_ms: 20,
-    };
+    let config = test_config(&repo);
     let (mut service, _socket) = build_service(config);
     initialize_service(&mut service, &app_uri).await;
 
@@ -163,11 +253,61 @@ async fn code_lens_surfaces_active_lock_annotations() {
     .unwrap();
 
     let uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.ts")).unwrap();
-    let config = CodexLspConfig {
-        repo_path: Some(repo.workdir().unwrap().to_path_buf()),
-        base_ref: "HEAD".to_string(),
-        event_poll_ms: 20,
-    };
+    let config = test_config(&repo);
+    let (mut service, _socket) = build_service(config);
+    initialize_service(&mut service, &uri).await;
+
+    let lenses = service
+        .inner()
+        .code_lens(CodeLensParams {
+            text_document: TextDocumentIdentifier { uri },
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(lenses.len(), 1);
+    assert!(
+        lenses[0]
+            .command
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("Agent alice is editing this function")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn code_lens_surfaces_python_lock_annotations() {
+    let (_dir, repo) = init_temp_repo();
+    write_and_stage(
+        &repo,
+        "src/app.py",
+        "def validate(input: str) -> bool:\n    return len(input) > 0\n",
+    );
+    commit(&repo, "initial");
+
+    let codex_dir = repo.workdir().unwrap().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("locks.json"),
+        serde_json::to_string_pretty(&json!([{
+            "agent_name": "alice",
+            "agent_id": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "target_name": "validate",
+            "target": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            "kind": "Write"
+        }]))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.py")).unwrap();
+    let config = test_config(&repo);
     let (mut service, _socket) = build_service(config);
     initialize_service(&mut service, &uri).await;
 
@@ -212,11 +352,7 @@ async fn did_save_publishes_validation_status_for_unlocked_change() {
     .unwrap();
 
     let uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.ts")).unwrap();
-    let config = CodexLspConfig {
-        repo_path: Some(repo.workdir().unwrap().to_path_buf()),
-        base_ref: "HEAD".to_string(),
-        event_poll_ms: 20,
-    };
+    let config = test_config(&repo);
     let (mut service, _socket) = build_service(config);
     initialize_service(&mut service, &uri).await;
 
@@ -244,11 +380,7 @@ async fn initialized_publishes_semantic_event_notifications() {
     )
     .unwrap();
 
-    let config = CodexLspConfig {
-        repo_path: Some(repo.workdir().unwrap().to_path_buf()),
-        base_ref: "HEAD".to_string(),
-        event_poll_ms: 20,
-    };
+    let config = test_config(&repo);
     let (service, _socket) = build_service(config);
 
     let payloads = service
@@ -264,6 +396,146 @@ async fn initialized_publishes_semantic_event_notifications() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn completion_hover_and_definition_are_proxied_to_upstream() {
+    let (_dir, repo) = init_temp_repo();
+    write_and_stage(
+        &repo,
+        "src/app.ts",
+        "function alpha(): number { return 1; }\nalpha();",
+    );
+    commit(&repo, "initial");
+
+    let uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.ts")).unwrap();
+    let config = upstream_test_config(&repo);
+    let (mut service, _socket) = build_service(config);
+    initialize_service(&mut service, &uri).await;
+
+    let completion = service
+        .inner()
+        .completion(CompletionParams {
+            text_document_position: position_params(&uri),
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+            context: Some(CompletionContext {
+                trigger_kind: tower_lsp::lsp_types::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            }),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let items = match completion {
+        tower_lsp::lsp_types::CompletionResponse::Array(items) => items,
+        tower_lsp::lsp_types::CompletionResponse::List(list) => list.items,
+    };
+    assert_eq!(items[0].label, "upstream-item");
+
+    let hover = service
+        .inner()
+        .hover(HoverParams {
+            text_document_position_params: position_params(&uri),
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    match hover.contents {
+        HoverContents::Markup(markup) => assert_eq!(markup.value, "upstream hover"),
+        HoverContents::Scalar(tower_lsp::lsp_types::MarkedString::String(value)) => {
+            assert_eq!(value, "upstream hover")
+        }
+        _ => panic!("unexpected hover payload"),
+    }
+
+    let definition = service
+        .inner()
+        .goto_definition(GotoDefinitionParams {
+            text_document_position_params: position_params(&uri),
+            work_done_progress_params: WorkDoneProgressParams {
+                work_done_token: None,
+            },
+            partial_result_params: PartialResultParams {
+                partial_result_token: None,
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    match definition {
+        tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri, uri);
+            assert_eq!(location.range.start.line, 0);
+        }
+        _ => panic!("unexpected definition payload"),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn did_save_merges_local_and_upstream_diagnostics() {
+    let (_dir, repo) = init_temp_repo();
+    write_and_stage(
+        &repo,
+        "src/app.ts",
+        "function validate(input: string): boolean { return input.length > 0; }",
+    );
+    commit(&repo, "initial");
+
+    let updated = "function validate(input: string): boolean { return input.length > 1; }";
+    std::fs::write(repo.workdir().unwrap().join("src/app.ts"), updated).unwrap();
+
+    let uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.ts")).unwrap();
+    let config = upstream_test_config(&repo);
+    let (mut service, socket) = build_service(config);
+    let mut notifications = spawn_client_socket_task(socket);
+    initialize_service(&mut service, &uri).await;
+    let _ = wait_for_notification(&mut notifications, "window/logMessage").await;
+
+    service
+        .inner()
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "typescript".to_string(),
+                version: 1,
+                text: updated.to_string(),
+            },
+        })
+        .await;
+
+    service
+        .inner()
+        .did_save(DidSaveTextDocumentParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            text: Some(updated.to_string()),
+        })
+        .await;
+
+    let diagnostics = wait_for_publish_diagnostics(&mut notifications, 2).await;
+    let messages: Vec<_> = diagnostics["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|diagnostic| diagnostic["message"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("without a Write lock"))
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message == "upstream diagnostic")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn graceful_degradation_without_codex_state_returns_empty_annotations() {
     let (_dir, repo) = init_temp_repo();
     write_and_stage(
@@ -274,11 +546,7 @@ async fn graceful_degradation_without_codex_state_returns_empty_annotations() {
     commit(&repo, "initial");
 
     let uri = Url::from_file_path(repo.workdir().unwrap().join("src/app.ts")).unwrap();
-    let config = CodexLspConfig {
-        repo_path: Some(repo.workdir().unwrap().to_path_buf()),
-        base_ref: "HEAD".to_string(),
-        event_poll_ms: 20,
-    };
+    let config = test_config(&repo);
     let (mut service, _socket) = build_service(config);
     initialize_service(&mut service, &uri).await;
 
