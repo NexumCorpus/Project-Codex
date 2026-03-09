@@ -6,6 +6,8 @@ Thumbs.db
 
 # Tool caches
 .nex/
+__pycache__/
+*.pyc
 
 # Spec documents (keep out of public repo)
 *.docx

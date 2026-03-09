@@ -2,7 +2,7 @@
 
 **AI-native code coordination for multi-agent software engineering.**
 
-Nexum Graph is a deterministic coordination layer that enables multiple AI coding agents to work on the same codebase without corrupting each other's changes. It parses code into a semantic graph, provides intent-based locking, validates changes against lock ownership, and maintains an immutable event log for rollback and replay.
+Nexum Graph is a deterministic coordination layer that enables multiple AI coding agents to work on the same codebase without corrupting each other's changes. It parses code into a semantic graph, provides intent-based locking with CRDT-backed distributed convergence, validates changes against lock ownership, and maintains an async event log for rollback and replay.
 
 Zero lines of Rust were written by a human. Claude wrote the types, tests, and prompts. OpenAI Codex filled in every function body.
 
@@ -12,9 +12,9 @@ Five-layer deterministic chassis:
 
 ```
  Layer 1 ─ Semantic Code Graph    tree-sitter CST → petgraph DiGraph
- Layer 2 ─ Intent Coordination    semantic locking, conflict detection
+ Layer 2 ─ Intent Coordination    semantic locking, CRDT sync, conflict detection
  Layer 3 ─ Continuous Validation  pre-commit lock coverage checks
- Layer 4 ─ Immutable Event Log    append-only log, rollback, replay
+ Layer 4 ─ Immutable Event Log    async append-only log, rollback, replay
  Layer 5 ─ IDE Integration        LSP shim + HTTP coordination server
 ```
 
@@ -25,13 +25,21 @@ Five-layer deterministic chassis:
 | Crate | Purpose |
 |---|---|
 | `nex-core` | Authoritative types (`SemanticUnit`, `SemanticId`, `SemanticDiff`, `DepKind`) |
-| `nex-parse` | Tree-sitter extraction, `SemanticExtractor` trait, TypeScript + Python extractors |
+| `nex-parse` | Tree-sitter extraction, `SemanticExtractor` trait, TypeScript + Python + Rust extractors |
 | `nex-graph` | `petgraph` semantic graph, diff algorithm |
-| `nex-coord` | Conflict detection, coordination engine, intent lifecycle |
+| `nex-coord` | Conflict detection, coordination engine, intent lifecycle, Loro CRDT replica sync |
 | `nex-validate` | Pre-commit validation (lock coverage, broken references, stale callers) |
-| `nex-eventlog` | Append-only event log, compensating rollback, state replay |
+| `nex-eventlog` | Async event log with pluggable backends (local-file default, JetStream opt-in) |
 | `nex-lsp` | `tower-lsp` proxy with semantic diff, lock annotations, event streaming |
 | `nex-cli` | CLI binary with 10 subcommands |
+
+## Supported Languages
+
+| Language | Extractor | Constructs |
+|---|---|---|
+| TypeScript / TSX | `nex-parse::typescript` | Functions, classes, methods, interfaces, enums, type aliases |
+| Python | `nex-parse::python` | Functions, classes, methods, decorators, async variants |
+| Rust | `nex-parse::rust` | Functions, structs, enums, traits, impl methods, inline modules |
 
 ## Installation
 
@@ -39,6 +47,7 @@ Five-layer deterministic chassis:
 
 - Rust 1.85+ (edition 2024)
 - Git (for repository operations)
+- Python 3.10+ (optional, for developer tools)
 
 ### Build from source
 
@@ -56,7 +65,7 @@ The binary is at `target/release/nex` (or `target/release/nex.exe` on Windows).
 cargo test --workspace
 ```
 
-All 165 tests should pass.
+All 186 tests should pass.
 
 ## Commands
 
@@ -89,7 +98,7 @@ nex lock alice validate write
 nex lock bob processRequest read
 ```
 
-Requests a semantic lock on a named code unit. Lock kinds: `read`, `write`, `delete`. Multiple read locks are compatible; write and delete locks are exclusive.
+Requests a semantic lock on a named code unit. Lock kinds: `read`, `write`, `delete`. Multiple read locks are compatible; write and delete locks are exclusive. Lock state is persisted to `.nex/coordination.loro` (CRDT) with a `.nex/locks.json` compatibility snapshot.
 
 ### `nex unlock` — Release a semantic lock
 
@@ -120,7 +129,7 @@ nex log
 nex log --intent-id <uuid> --format json
 ```
 
-Shows the semantic event log (`.nex/events.json`). Each event records an agent's committed intent with mutations, parent event, and tags.
+Shows the semantic event log. The default backend writes to `.nex/events.json`; set `NEX_EVENTLOG_BACKEND=jetstream` to publish events into a NATS JetStream stream instead.
 
 ### `nex rollback` — Semantic rollback
 
@@ -163,27 +172,89 @@ nex-lsp --repo-path . --base-ref HEAD~1
 Custom LSP methods:
 - `nex/semanticDiff` — file-scoped semantic diff
 - `nex/activeLocks` — lock annotations as code lenses
+- `nex/agentIntent` — intent declaration from IDE actions
 - `nex/validationStatus` — real-time validation diagnostics
 - `nex/eventStream` — semantic event notifications
+
+The LSP also supports upstream proxy pass-through, forwarding standard LSP requests to an existing language server while injecting Nexum Graph overlays.
+
+## Developer Tools
+
+Python-based tools for spec-driven development workflows:
+
+### `tools/spec_query.py` — Search implementation specs
+
+```bash
+python tools/spec_query.py locking --doc spec
+python tools/spec_query.py "CRDT coordination" --mode phrase --stats
+python tools/spec_query.py "semantic.*lock" --mode regex --max-results 5 --json
+```
+
+Extracts text from `.docx` spec documents and searches with configurable modes (`all`, `any`, `phrase`, `regex`). Caches extracted text with mtime-based invalidation.
+
+### `tools/verify_slice.py` — Targeted workspace verification
+
+```bash
+python tools/verify_slice.py --crate nex-coord
+python tools/verify_slice.py --changed
+python tools/verify_slice.py --since origin/main --json
+python tools/verify_slice.py --list-crates
+```
+
+Derives the workspace dependency DAG from live `cargo metadata`, infers impacted crates from changed files, expands transitive dependents, and runs `cargo test` + `cargo clippy` + `cargo fmt --check` for the affected crate set.
+
+### `tools/workspace_doctor.py` — Workspace health check
+
+```bash
+python tools/workspace_doctor.py
+python tools/workspace_doctor.py --legacy-scan --json
+```
+
+Checks toolchain availability, spec document presence, local Codex skill installation, dirty-tree impact analysis, and optional legacy-name scanning.
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEX_EVENTLOG_BACKEND` | `local-file` | Event log backend (`local-file` or `jetstream`) |
+| `NEX_NATS_URL` | `nats://127.0.0.1:4222` | NATS server URL (JetStream backend) |
+| `NEX_EVENTLOG_STREAM` | `nex_events` | JetStream stream name prefix |
+| `NEX_EVENTLOG_SUBJECT_PREFIX` | `nex.events` | NATS subject prefix |
+| `NEX_COORD_PEER_ID` | Auto-derived | CRDT peer ID override (default: BLAKE3 hash of hostname + repo path) |
+
+### State Directory
+
+Nexum Graph stores local state in `.nex/` at the repository root:
+
+| File | Purpose |
+|---|---|
+| `coordination.loro` | CRDT document for distributed lock convergence |
+| `locks.json` | Backward-compatible JSON lock snapshot |
+| `events.json` | Local event log (when using `local-file` backend) |
+| `cache/` | Tool caches (spec text extraction) |
 
 ## How It Works
 
 1. **Parse**: Tree-sitter parses source files into concrete syntax trees. The `SemanticExtractor` trait maps CST nodes to `SemanticUnit` values with content-addressed IDs (BLAKE3), signature hashes, and normalized body hashes.
 
-2. **Graph**: Units and their dependency edges (calls, imports, inheritance) form a `petgraph` directed graph. Diffing two graphs produces added/removed/modified classifications.
+2. **Graph**: Units and their dependency edges (calls, imports, inheritance, implementations) form a `petgraph` directed graph. Diffing two graphs produces added/removed/modified classifications.
 
-3. **Coordinate**: Agents declare intents targeting specific units. The coordination engine acquires semantic locks, checks for conflicts with existing lock holders, and manages intent lifecycles (declare → commit/abort) with TTL-based expiry.
+3. **Coordinate**: Agents declare intents targeting specific units. The coordination engine acquires semantic locks, checks for conflicts with existing lock holders, and manages intent lifecycles (declare -> commit/abort) with TTL-based expiry. CRDT-backed state enables distributed replica convergence via `export_crdt` / `merge_crdt`.
 
 4. **Validate**: Before commit, the validation engine checks that every modification is covered by a write lock, every deletion by a delete lock, and flags broken references and stale callers.
 
-5. **Log**: Committed intents produce immutable semantic events with structured mutations. The event log supports compensating rollback and state replay.
+5. **Log**: Committed intents produce immutable semantic events with structured mutations. The async event log supports compensating rollback and state replay, with pluggable backends for local files or NATS JetStream.
 
 ## Numbers
 
-- **165** tests, all passing
+- **186** tests, all passing
 - **5** architectural layers
-- **10** CLI commands
+- **10** CLI subcommands
 - **8** workspace crates
+- **3** language extractors (TypeScript, Python, Rust)
+- **5** custom LSP methods
 - **0** lines of Rust written by a human
 
 ## License
