@@ -4,6 +4,9 @@
 .DS_Store
 Thumbs.db
 
+# Tool caches
+.nex/
+
 # Spec documents (keep out of public repo)
 *.docx
 *.pdf

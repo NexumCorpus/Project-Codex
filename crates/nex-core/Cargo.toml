@@ -1,0 +1,12 @@
+[package]
+name = "nex-core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Shared types, errors, and configuration for Nexum Graph"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }

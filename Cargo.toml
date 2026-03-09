@@ -1,15 +1,15 @@
 [workspace]
 members = [
-    "crates/codex-core",
-    "crates/codex-parse",
-    "crates/codex-graph",
-    "crates/codex-coord",
-    "crates/codex-validate",
-    "crates/codex-eventlog",
-    "crates/codex-lsp",
-    "crates/codex-cli",
+    "crates/nex-core",
+    "crates/nex-parse",
+    "crates/nex-graph",
+    "crates/nex-coord",
+    "crates/nex-validate",
+    "crates/nex-eventlog",
+    "crates/nex-lsp",
+    "crates/nex-cli",
 ]
-default-members = ["crates/codex-cli"]
+default-members = ["crates/nex-cli"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -28,7 +28,7 @@ petgraph = "0.8"
 loro = "1"
 
 # Networking & Event Streaming
-async-nats = "0.46"
+async-nats = { version = "0.46", features = ["jetstream"] }
 tower-lsp = "0.20"
 
 # CLI
@@ -56,9 +56,9 @@ thiserror = "2"
 tracing = "0.1"
 
 # Internal crates
-codex-core = { path = "crates/codex-core" }
-codex-parse = { path = "crates/codex-parse" }
-codex-graph = { path = "crates/codex-graph" }
-codex-coord = { path = "crates/codex-coord" }
-codex-validate = { path = "crates/codex-validate" }
-codex-eventlog = { path = "crates/codex-eventlog" }
+nex-core = { path = "crates/nex-core" }
+nex-parse = { path = "crates/nex-parse" }
+nex-graph = { path = "crates/nex-graph" }
+nex-coord = { path = "crates/nex-coord" }
+nex-validate = { path = "crates/nex-validate" }
+nex-eventlog = { path = "crates/nex-eventlog" }

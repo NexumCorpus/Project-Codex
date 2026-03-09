@@ -1,0 +1,38 @@
+[package]
+name = "nex-lsp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "LSP proxy for IDE integration with semantic coordination"
+
+[lib]
+name = "nex_lsp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nex-lsp"
+path = "src/main.rs"
+
+[[bin]]
+name = "nex-lsp-fake-upstream"
+path = "src/bin/nex-lsp-fake-upstream.rs"
+
+[dependencies]
+clap = { workspace = true }
+nex-core = { workspace = true }
+nex-eventlog = { workspace = true }
+nex-parse = { workspace = true }
+nex-graph = { workspace = true }
+git2 = { workspace = true }
+tower-lsp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tower = { version = "0.4", features = ["util"] }
+uuid = { workspace = true }
+
+[dev-dependencies]
+futures-util = "0.3"
+tempfile = "3"

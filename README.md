@@ -1,8 +1,8 @@
-# Project Codex
+# Nexum Graph
 
 **AI-native code coordination for multi-agent software engineering.**
 
-Project Codex is a deterministic coordination layer that enables multiple AI coding agents to work on the same codebase without corrupting each other's changes. It parses code into a semantic graph, provides intent-based locking, validates changes against lock ownership, and maintains an immutable event log for rollback and replay.
+Nexum Graph is a deterministic coordination layer that enables multiple AI coding agents to work on the same codebase without corrupting each other's changes. It parses code into a semantic graph, provides intent-based locking, validates changes against lock ownership, and maintains an immutable event log for rollback and replay.
 
 Zero lines of Rust were written by a human. Claude wrote the types, tests, and prompts. OpenAI Codex filled in every function body.
 
@@ -24,14 +24,14 @@ Five-layer deterministic chassis:
 
 | Crate | Purpose |
 |---|---|
-| `codex-core` | Authoritative types (`SemanticUnit`, `SemanticId`, `SemanticDiff`, `DepKind`) |
-| `codex-parse` | Tree-sitter extraction, `SemanticExtractor` trait, TypeScript extractor |
-| `codex-graph` | `petgraph` semantic graph, diff algorithm |
-| `codex-coord` | Conflict detection, coordination engine, intent lifecycle |
-| `codex-validate` | Pre-commit validation (lock coverage, broken references, stale callers) |
-| `codex-eventlog` | Append-only event log, compensating rollback, state replay |
-| `codex-lsp` | `tower-lsp` proxy with semantic diff, lock annotations, event streaming |
-| `codex-cli` | CLI binary with 10 subcommands |
+| `nex-core` | Authoritative types (`SemanticUnit`, `SemanticId`, `SemanticDiff`, `DepKind`) |
+| `nex-parse` | Tree-sitter extraction, `SemanticExtractor` trait, TypeScript + Python extractors |
+| `nex-graph` | `petgraph` semantic graph, diff algorithm |
+| `nex-coord` | Conflict detection, coordination engine, intent lifecycle |
+| `nex-validate` | Pre-commit validation (lock coverage, broken references, stale callers) |
+| `nex-eventlog` | Append-only event log, compensating rollback, state replay |
+| `nex-lsp` | `tower-lsp` proxy with semantic diff, lock annotations, event streaming |
+| `nex-cli` | CLI binary with 10 subcommands |
 
 ## Installation
 
@@ -43,12 +43,12 @@ Five-layer deterministic chassis:
 ### Build from source
 
 ```bash
-git clone https://github.com/NexumCorpus/Project-Codex.git
-cd Project-Codex
+git clone https://github.com/NexumCorpus/Nexum-Graph.git
+cd Nexum-Graph
 cargo build --release
 ```
 
-The binary is at `target/release/codex` (or `target/release/codex.exe` on Windows).
+The binary is at `target/release/nex` (or `target/release/nex.exe` on Windows).
 
 ### Verify
 
@@ -56,24 +56,24 @@ The binary is at `target/release/codex` (or `target/release/codex.exe` on Window
 cargo test --workspace
 ```
 
-All 147 tests should pass.
+All 165 tests should pass.
 
 ## Commands
 
-### `codex diff` — Semantic diff between two git refs
+### `nex diff` — Semantic diff between two git refs
 
 ```bash
-codex diff v1 v2 --format text
-codex diff main feature-branch --format json
+nex diff v1 v2 --format text
+nex diff main feature-branch --format json
 ```
 
 Computes a semantic diff showing added, removed, and modified code units (functions, classes, methods) between two git refs. Understands signature vs body-only changes.
 
-### `codex check` — Conflict detection between branches
+### `nex check` — Conflict detection between branches
 
 ```bash
-codex check branch-a branch-b
-codex check feature-1 feature-2 --format json
+nex check branch-a branch-b
+nex check feature-1 feature-2 --format json
 ```
 
 Three-way merge analysis that detects four conflict types:
@@ -82,66 +82,66 @@ Three-way merge analysis that detects four conflict types:
 - **Broken Reference** — dependency target deleted or moved
 - **Stale Caller** — caller body unchanged but callee signature changed
 
-### `codex lock` — Acquire a semantic lock
+### `nex lock` — Acquire a semantic lock
 
 ```bash
-codex lock alice validate write
-codex lock bob processRequest read
+nex lock alice validate write
+nex lock bob processRequest read
 ```
 
 Requests a semantic lock on a named code unit. Lock kinds: `read`, `write`, `delete`. Multiple read locks are compatible; write and delete locks are exclusive.
 
-### `codex unlock` — Release a semantic lock
+### `nex unlock` — Release a semantic lock
 
 ```bash
-codex unlock alice validate
+nex unlock alice validate
 ```
 
-### `codex locks` — List active locks
+### `nex locks` — List active locks
 
 ```bash
-codex locks
-codex locks --format json
+nex locks
+nex locks --format json
 ```
 
-### `codex validate` — Check lock coverage
+### `nex validate` — Check lock coverage
 
 ```bash
-codex validate alice --base HEAD~1
-codex validate bob --base main --format json
+nex validate alice --base HEAD~1
+nex validate bob --base main --format json
 ```
 
 Validates that all modifications in the working tree are covered by semantic locks held by the named agent. Reports unlocked modifications, unlocked deletions, broken references, and stale callers.
 
-### `codex log` — Event history
+### `nex log` — Event history
 
 ```bash
-codex log
-codex log --intent-id <uuid> --format json
+nex log
+nex log --intent-id <uuid> --format json
 ```
 
-Shows the semantic event log (`.codex/events.json`). Each event records an agent's committed intent with mutations, parent event, and tags.
+Shows the semantic event log (`.nex/events.json`). Each event records an agent's committed intent with mutations, parent event, and tags.
 
-### `codex rollback` — Semantic rollback
+### `nex rollback` — Semantic rollback
 
 ```bash
-codex rollback <intent-id> alice
+nex rollback <intent-id> alice
 ```
 
 Generates compensating mutations that reverse a prior intent's changes. Detects conflicts if later events modified the same units.
 
-### `codex replay` — Replay state to a point in time
+### `nex replay` — Replay state to a point in time
 
 ```bash
-codex replay --to <event-id>
+nex replay --to <event-id>
 ```
 
 Applies all mutations in order up to the specified event, producing the semantic state at that point.
 
-### `codex serve` — Coordination server
+### `nex serve` — Coordination server
 
 ```bash
-codex serve --host 127.0.0.1 --port 4000
+nex serve --host 127.0.0.1 --port 4000
 ```
 
 Starts an HTTP + WebSocket coordination server exposing:
@@ -154,17 +154,17 @@ Starts an HTTP + WebSocket coordination server exposing:
 
 ## LSP Server
 
-The `codex-lsp` binary provides IDE integration via the Language Server Protocol:
+The `nex-lsp` binary provides IDE integration via the Language Server Protocol:
 
 ```bash
-codex-lsp --repo-path . --base-ref HEAD~1
+nex-lsp --repo-path . --base-ref HEAD~1
 ```
 
 Custom LSP methods:
-- `codex/semanticDiff` — file-scoped semantic diff
-- `codex/activeLocks` — lock annotations as code lenses
-- `codex/validationStatus` — real-time validation diagnostics
-- `codex/eventStream` — semantic event notifications
+- `nex/semanticDiff` — file-scoped semantic diff
+- `nex/activeLocks` — lock annotations as code lenses
+- `nex/validationStatus` — real-time validation diagnostics
+- `nex/eventStream` — semantic event notifications
 
 ## How It Works
 
@@ -180,7 +180,7 @@ Custom LSP methods:
 
 ## Numbers
 
-- **147** tests, all passing
+- **165** tests, all passing
 - **5** architectural layers
 - **10** CLI commands
 - **8** workspace crates
